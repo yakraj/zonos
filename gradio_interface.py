@@ -216,7 +216,7 @@ def split_text_into_segments(text, max_length=250):
     while start < len(text):
         if len(text) - start <= max_length:
             segment = text[start:].strip()
-            segments.append("    " + segment + "    ")
+            segments.append(segment + "    ")
             break
         end = start + max_length
         # Search for punctuation in the current slice

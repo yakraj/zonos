@@ -1,7 +1,10 @@
 import torch
 import torchaudio
 import gradio as gr
+import re
+import numpy as np
 from os import getenv
+import os
 
 from zonos.model import Zonos, DEFAULT_BACKBONE_CLS as ZonosBackbone
 from zonos.conditioning import make_cond_dict, supported_language_codes
@@ -9,10 +12,10 @@ from zonos.utils import DEFAULT_DEVICE as device
 
 CURRENT_MODEL_TYPE = None
 CURRENT_MODEL = None
-
 SPEAKER_EMBEDDING = None
 SPEAKER_AUDIO_PATH = None
 
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 def load_model_if_needed(model_choice: str):
     global CURRENT_MODEL_TYPE, CURRENT_MODEL
@@ -26,7 +29,6 @@ def load_model_if_needed(model_choice: str):
         CURRENT_MODEL_TYPE = model_choice
         print(f"{model_choice} model loaded successfully!")
     return CURRENT_MODEL
-
 
 def update_ui(model_choice):
     """
@@ -81,7 +83,6 @@ def update_ui(model_choice):
         unconditional_keys_update,
     )
 
-
 def generate_audio(
     model_choice,
     text,
@@ -133,9 +134,10 @@ def generate_audio(
     confidence = float(confidence)
     quadratic = float(quadratic)
     seed = int(seed)
-    max_new_tokens = 86 * 30
+    estimated_generation_duration = 30 * len(text) / 400
+    estimated_total_steps = int(estimated_generation_duration * 86)
+    max_new_tokens = estimated_total_steps
 
-    # This is a bit ew, but works for now.
     global SPEAKER_AUDIO_PATH, SPEAKER_EMBEDDING
 
     if randomize_seed:
@@ -194,6 +196,7 @@ def generate_audio(
         batch_size=1,
         sampling_params=dict(top_p=top_p, top_k=top_k, min_p=min_p, linear=linear, conf=confidence, quad=quadratic),
         callback=update_progress,
+        disable_torch_compile=True if "transformer" in model_choice else False,
     )
 
     wav_out = selected_model.autoencoder.decode(codes).cpu().detach()
@@ -202,6 +205,120 @@ def generate_audio(
         wav_out = wav_out[0:1, :]
     return (sr_out, wav_out.squeeze().numpy()), seed
 
+def split_text_into_segments(text, max_length=250):
+    """
+    Splits the input text into segments with a maximum of max_length characters.
+    It tries not to split words or sentences by finding the nearest punctuation or whitespace.
+    Each segment is padded with 4 leading and 4 trailing spaces.
+    """
+    segments = []
+    start = 0
+    while start < len(text):
+        if len(text) - start <= max_length:
+            segment = text[start:].strip()
+            segments.append("    " + segment + "    ")
+            break
+        end = start + max_length
+        # Search for punctuation in the current slice
+        punctuation_positions = [m.start() for m in re.finditer(r'[.?!,;:]', text[start:end])]
+        if punctuation_positions:
+            split_pos = punctuation_positions[-1] + 1  # include punctuation
+        else:
+            # Fallback: use the last whitespace
+            split_pos = text[start:end].rfind(' ')
+            if split_pos == -1:
+                split_pos = max_length
+            else:
+                split_pos += 1
+        segment = text[start:start+split_pos].strip()
+        segments.append("    " + segment + "    ")
+        start += split_pos
+    return segments
+
+def generate_audio_from_long_text(
+    model_choice,
+    text,
+    language,
+    speaker_audio,
+    prefix_audio,
+    e1,
+    e2,
+    e3,
+    e4,
+    e5,
+    e6,
+    e7,
+    e8,
+    vq_single,
+    fmax,
+    pitch_std,
+    speaking_rate,
+    dnsmos_ovrl,
+    speaker_noised,
+    cfg_scale,
+    top_p,
+    top_k,
+    min_p,
+    linear,
+    confidence,
+    quadratic,
+    seed,
+    randomize_seed,
+    unconditional_keys,
+    progress=gr.Progress()
+):
+    """
+    Splits the long text into segments of ≤250 characters without breaking words or sentences.
+    Generates audio for each segment, inserts a 200-millisecond gap of silence between segments,
+    and concatenates all segments into one final audio.
+    """
+    segments = split_text_into_segments(text, max_length=250)
+    all_audio_segments = []
+    final_seed = seed  # Optionally update per segment if needed
+
+    for i, segment in enumerate(segments):
+        (sr, audio), final_seed = generate_audio(
+            model_choice,
+            segment,
+            language,
+            speaker_audio,
+            prefix_audio,
+            e1,
+            e2,
+            e3,
+            e4,
+            e5,
+            e6,
+            e7,
+            e8,
+            vq_single,
+            fmax,
+            pitch_std,
+            speaking_rate,
+            dnsmos_ovrl,
+            speaker_noised,
+            cfg_scale,
+            top_p,
+            top_k,
+            min_p,
+            linear,
+            confidence,
+            quadratic,
+            seed,
+            randomize_seed,
+            unconditional_keys,
+            progress
+        )
+        all_audio_segments.append(audio)
+        # If this isn't the last segment, insert a 200-millisecond gap (silence)
+        if i < len(segments) - 1:
+            gap_duration = 0.1  # seconds (200 milliseconds)
+            gap_samples = int(sr * gap_duration)
+            silence = np.zeros(gap_samples, dtype=audio.dtype)
+            all_audio_segments.append(silence)
+
+    final_audio = np.concatenate(all_audio_segments)
+    return (sr, final_audio), final_seed
 
 def build_interface():
     supported_models = []
@@ -229,7 +346,7 @@ def build_interface():
                     label="Text to Synthesize",
                     value="Zonos uses eSpeak for text to phoneme conversion!",
                     lines=4,
-                    max_length=500,  # approximately
+                    max_length=20000,  # approximately
                 )
                 language = gr.Dropdown(
                     choices=supported_language_codes,
@@ -269,9 +386,8 @@ def build_interface():
                 with gr.Column():
                     gr.Markdown("### NovelAi's unified sampler")
                     linear_slider = gr.Slider(-2.0, 2.0, 0.5, 0.01, label="Linear (set to 0 to disable unified sampling)", info="High values make the output less random.")
-                    #Conf's theoretical range is between -2 * Quad and 0.
                     confidence_slider = gr.Slider(-2.0, 2.0, 0.40, 0.01, label="Confidence", info="Low values make random outputs more random.")
-                    quadratic_slider = gr.Slider(-2.0, 2.0, 0.00, 0.01, label="Quadratic", info="High values make low probablities much lower.")
+                    quadratic_slider = gr.Slider(-2.0, 2.0, 0.00, 0.01, label="Quadratic", info="High values make low probabilities much lower.")
                 with gr.Column():
                     gr.Markdown("### Legacy sampling")
                     top_p_slider = gr.Slider(0.0, 1.0, 0, 0.01, label="Top P")
@@ -373,9 +489,9 @@ def build_interface():
             ],
         )
 
-        # Generate audio on button click
+        # Generate audio on button click using the new function that handles long text
         generate_button.click(
-            fn=generate_audio,
+            fn=generate_audio_from_long_text,
             inputs=[
                 model_choice,
                 text,
@@ -412,8 +528,8 @@ def build_interface():
 
     return demo
 
-
 if __name__ == "__main__":
     demo = build_interface()
     share = getenv("GRADIO_SHARE", "False").lower() in ("true", "1", "t")
-    demo.launch(server_name="0.0.0.0", server_port=7860, share=share)
+    host = getenv("GRADIO_HOST", "0.0.0.0")
+    demo.launch(server_name=host, inbrowser=True, share=share)
